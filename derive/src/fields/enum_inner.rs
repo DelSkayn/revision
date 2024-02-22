@@ -50,10 +50,10 @@ impl EnumInner {
 		}
 	}
 
-	pub fn reexpand(&self) -> TokenStream {
+	pub fn reexpand(&self, current: u16) -> TokenStream {
 		match self {
-			Self::EnumTuple(v) => v.reexpand(),
-			Self::EnumStruct(v) => v.reexpand(),
+			Self::EnumTuple(v) => v.reexpand(current),
+			Self::EnumStruct(v) => v.reexpand(current),
 		}
 	}
 }

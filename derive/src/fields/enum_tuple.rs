@@ -1,15 +1,100 @@
-use super::ParsedEnumVariant;
+use super::{ParsedEnumVariant, ParsedField};
 use crate::common::Exists;
-use darling::FromVariant;
+use darling::{FromField, FromVariant};
 use proc_macro2::{Span, TokenStream};
 use proc_macro_error::abort;
 use quote::{format_ident, quote};
+use syn::spanned::Spanned;
+
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub(crate) struct EnumTupleField {
+	index: u32,
+	field: ParsedField,
+}
+
+impl Exists for EnumTupleField {
+	fn start_revision(&self) -> u16 {
+		self.field.start.unwrap_or(0)
+	}
+	fn end_revision(&self) -> Option<u16> {
+		self.field.end
+	}
+	fn sub_revision(&self) -> u16 {
+		0
+	}
+}
+
+impl EnumTupleField {
+	pub fn check_attributes(&self, current: u16) {
+		if !self.exists_at(current) && self.field.convert_fn.is_none() {
+			abort!(
+				self.field.ty.span(),
+				"Expected a 'convert_fn' to be specified for field {}",
+				self.index
+			);
+		}
+	}
+
+	pub fn generate_deserializer_field(
+		&self,
+		idx: u32,
+		current: u16,
+		revision: u16,
+	) -> (TokenStream, Option<TokenStream>) {
+		let kind = &self.field.ty;
+		let field = format_ident!("v{}", idx);
+
+		if !self.exists_at(revision) {
+			if let Some(def) = self.field.default_fn.as_ref() {
+				let def_fn = format_ident!("{}", def);
+				return (
+					quote! {
+						let #field = Self::#def_fn();
+					},
+					None,
+				);
+			}
+
+			if self.end_revision().map(|x| x <= revision).unwrap_or(false) {
+				return (TokenStream::new(), None);
+			} else {
+				return (
+					quote! {
+						let #field = Default::default();
+					},
+					None,
+				);
+			}
+		}
+
+		if self.exists_at(revision) && !self.exists_at(current) {
+			let convert_fn = self.field.convert_fn.clone().unwrap();
+			let convert_fn = format_ident!("{convert_fn}");
+
+			return (
+				quote! {
+					let #field = <#kind as revision::Revisioned>::deserialize_revisioned(reader)?;
+				},
+				Some(quote! {
+					object.#convert_fn(revision, #field)?;
+				}),
+			);
+		}
+
+		(
+			quote! {
+				let #field = <#kind as revision::Revisioned>::deserialize_revisioned(reader)?;
+			},
+			None,
+		)
+	}
+}
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub(crate) struct EnumTuple {
 	revision: u16,
 	index: u32,
-	fields: Vec<syn::Type>,
+	fields: Vec<EnumTupleField>,
 	is_unit: bool,
 	parsed: ParsedEnumVariant,
 }
@@ -22,7 +107,11 @@ impl Exists for EnumTuple {
 		self.parsed.end
 	}
 	fn sub_revision(&self) -> u16 {
-		0
+		self.fields
+			.iter()
+			.map(|x| x.end_revision().unwrap_or(1).max(x.start_revision()))
+			.max()
+			.unwrap_or(0)
 	}
 }
 
@@ -41,7 +130,19 @@ impl EnumTuple {
 		// Process the enum variant fields
 		let fields = match &variant.fields {
 			syn::Fields::Unnamed(fields) => {
-				fields.unnamed.iter().map(|field| field.ty.clone()).collect()
+				let mut res = Vec::new();
+				for (idx, field) in fields.unnamed.iter().enumerate() {
+					match ParsedField::from_field(field) {
+						Ok(x) => res.push(EnumTupleField {
+							index: idx.try_into().unwrap(),
+							field: x,
+						}),
+						Err(e) => {
+							abort!(e.span(), "{e}")
+						}
+					}
+				}
+				res
 			}
 			syn::Fields::Unit => {
 				is_unit = true;
@@ -59,7 +160,7 @@ impl EnumTuple {
 		}
 	}
 
-	pub fn reexpand(&self) -> TokenStream {
+	pub fn reexpand(&self, current: u16) -> TokenStream {
 		let ident = &self.parsed.ident;
 		let attrs = &self.parsed.attrs;
 		if self.is_unit {
@@ -68,7 +169,7 @@ impl EnumTuple {
 				#ident
 			)
 		} else {
-			let fields = &self.fields;
+			let fields = self.fields.iter().filter(|x| x.exists_at(current)).map(|x| &x.field.ty);
 			quote!(
 				#(#attrs)*
 				#ident( #(#fields,)* )
@@ -96,7 +197,7 @@ impl EnumTuple {
 		// Create a token stream for the variant fields
 		let mut inner = TokenStream::new();
 		// Loop over each of the enum variant fields
-		for (index, _) in self.fields.iter().enumerate() {
+		for (index, _) in self.fields.iter().filter(|x| x.exists_at(current)).enumerate() {
 			// Get the field identifier
 			let field = format_ident!("v{}", index);
 			// Extend the enum constructor
@@ -142,42 +243,60 @@ impl EnumTuple {
 		let mut deserializer = TokenStream::new();
 		// Create a token stream for the fields
 		let mut inner = TokenStream::new();
+
+		let mut post_process = TokenStream::new();
 		// Loop over the enum variant fields
-		for (index, kind) in self.fields.iter().enumerate() {
+		for (index, field) in self.fields.iter().enumerate() {
+			field.check_attributes(current);
 			// Get the field identifier
-			let field = format_ident!("v{}", index);
+			let field_ident = format_ident!("v{}", index);
 			// Extend the enum constructor
-			inner.extend(quote!(#field,));
+			if field.exists_at(current) {
+				inner.extend(quote!(#field_ident,));
+			}
+
+			let (deserialize, pp) =
+				field.generate_deserializer_field(index.try_into().unwrap(), current, revision);
 			// Extend the deserializer
-			deserializer.extend(quote! {
-				let #field = <#kind as revision::Revisioned>::deserialize_revisioned(reader)?;
-			});
+			deserializer.extend(deserialize);
+			if let Some(p) = pp {
+				post_process.extend(p);
+			}
 		}
 		// Check if the variant no longer exists
 		if !self.exists_at(current) {
-			// Get the conversion function
-			let convert_fn =
-				syn::Ident::new(self.parsed.convert_fn.as_ref().unwrap(), Span::call_site());
-			// Output the
-			quote! {
-				#index => {
-					#deserializer
-					return Self::#convert_fn(revision, (#inner));
-				},
+			if let Some(conv_fn) = self.parsed.convert_fn.as_ref() {
+				let convert_fn = syn::Ident::new(conv_fn, Span::call_site());
+				quote! {
+					#index => {
+						#deserializer
+						let mut object = Self::#convert_fn(revision, (#inner));
+						#post_process
+						return object
+					},
+				}
+			} else {
+				quote! {
+					compile_error!()
+				}
 			}
 		} else {
 			// Check if this is a simple enum
 			if self.fields.is_empty() {
 				quote! {
 					#index => {
-						return Ok(Self::#ident);
+						let mut object = Self::#ident;
+						#post_process
+						return Ok(object);
 					},
 				}
 			} else {
 				quote! {
 					#index => {
 						#deserializer
-						return Ok(Self::#ident(#inner));
+						let mut object = Self::#ident(#inner);
+						#post_process
+						return Ok(object);
 					},
 				}
 			}

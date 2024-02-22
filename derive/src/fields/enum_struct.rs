@@ -64,7 +64,7 @@ impl EnumStruct {
 		}
 	}
 
-	pub fn reexpand(&self) -> TokenStream {
+	pub fn reexpand(&self, _current: u16) -> TokenStream {
 		let ident = &self.parsed.ident;
 		let attrs = &self.parsed.attrs;
 		let fields = self.fields.iter().map(|x| x.reexpand());

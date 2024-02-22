@@ -154,10 +154,7 @@ impl StructField {
 				let #field = <#kind as revision::Revisioned>::deserialize_revisioned(reader)?;
 			},
 			// Don't insert the field into the current struct
-			quote! {
-				// TODO: remove this field entirely using proc macro
-				#field: Default::default(),
-			},
+			quote! {},
 			// Post process the field data with the struct
 			match &self.parsed.convert_fn {
 				Some(convert_fn) => {

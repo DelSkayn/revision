@@ -135,8 +135,11 @@ impl Descriptor for EnumDescriptor {
 		let vis = &self.vis;
 		let ident = &self.ident;
 		let attrs = &self.attrs;
-		let fields =
-			self.fields.iter().filter(|x| x.exists_at(self.revision)).map(|e| e.reexpand());
+		let fields = self
+			.fields
+			.iter()
+			.filter(|x| x.exists_at(self.revision))
+			.map(|e| e.reexpand(self.revision));
 		let generics = &self.generics;
 
 		quote! {
